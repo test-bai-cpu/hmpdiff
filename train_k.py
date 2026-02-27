@@ -33,7 +33,7 @@ if_mod = bool(int(sys.argv[5]))
 if_div = bool(int(sys.argv[6]))
 if_smooth = bool(int(sys.argv[7]))
 
-version = f"V{param_setup_v}-predlen{pred_len}-sigma{sigma}-ut{if_ut}-mod{if_mod}-div{if_div}-smooth{if_smooth}"
+version = f"V{param_setup_v}-pred{pred_len}-sigma{sigma}-ut{if_ut}-mod{if_mod}-div{if_div}-smooth{if_smooth}"
 
 # version = "v8-20-k-mod"
 # version = "full-v8-20-k-gt-sigma0.2"
@@ -137,6 +137,7 @@ for epoch in range(1, n_epochs+1):
         if if_ut:
             mu_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
             x_t = mu_t + sigma * torch.randn_like(mu_t)
+            # print(f"ut is true, using sigma {sigma} for sampling x_t")
         ######## Or without sigma, just straight interpolation ########
         else:
             x_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
@@ -202,7 +203,8 @@ for epoch in range(1, n_epochs+1):
 
         # loss = lambda_gt * L_gt + lambda_smooth * L_smooth + lambda_mod * L_mod + lambda_div * L_div + L_anchor
         loss = lambda_gt * L_gt + (lambda_smooth * L_smooth if if_smooth else 0) + (lambda_mod * L_mod if if_mod else 0) + (lambda_div * L_div if if_div else 0)
-
+        # print("loss components includes: if_mod ", if_mod, ", if_div ", if_div, ", if_smooth ", if_smooth)
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -222,10 +224,12 @@ for epoch in range(1, n_epochs+1):
     val_loss_acc = torch.zeros((), device=device)
     with torch.no_grad():
         for X_obs, Y_fut, _ in tqdm(val_loader, desc=f"Epoch {epoch} [val]"):
-            X_obs = X_obs.to(device)
-            Y_fut = Y_fut.to(device)
+            X_obs = X_obs.to(device)      # (B, obs_len, F)
+            Y_fut = Y_fut.to(device)      # (B, pred_len, 2)
 
             B = X_obs.size(0)
+            D = pred_len * 2
+            
             x1 = Y_fut.reshape(B, -1)
             
             eps = torch.randn(B, K, pred_len, 2, device=device)
