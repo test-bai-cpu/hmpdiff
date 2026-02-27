@@ -16,17 +16,8 @@ from model import TrajectoryCFMModel, TrajectoryCFMModel_v2
 from eval_utils import evaluate_cfm, make_person_loader
 import train_utils
 
-# version = "v4"
-# version = "v5-ep100"
-# version = "v6-20"
-# version = "v7-20-k"
-# version = "v7-20-k-mod-div"
-# version = "v8-20-k-gt"
-# version = "v8-20-k-mod"
 # version = "full-v8-20-k-mod-sigma0.2"
-# version = "full-v8-20-k-mod"
-version = "full-v8-20-k-gt"
-# version = "full-v8-20-k-gt-sigma0.2"
+version = "full-v8-20-k-gt-sigma0.2"
 debug = False
 
 obs_len = 4
