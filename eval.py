@@ -16,14 +16,15 @@ from model import TrajectoryCFMModel, TrajectoryCFMModel_v2
 from eval_utils import evaluate_cfm, make_person_loader
 import train_utils
 
-# version = "full-v8-20-k-mod-sigma0.2"
-version = "full-v8-20-k-gt-sigma0.2"
+version = "V2-fix-t-pred20-sigma0.2-utTrue-modFalse-divTrue-smoothTrue"
+# version = "V2-fix-t-pred20-sigma0.2-utTrue-modTrue-divTrue-smoothTrue"
+print("Evaluating version:", version)
 debug = False
 
 obs_len = 4
 pred_len = 20
-stride = 10
-K = 8   # number of samples to generate for each input
+stride = pred_len // 2
+K = 5   # number of samples to generate for each input
 
 # =========================
 # Dataset

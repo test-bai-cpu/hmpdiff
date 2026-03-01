@@ -554,7 +554,7 @@ def plot_person_from_df(
     min, max: normalization stats for x,y (shape (2,))
     which: which sliding window of this person's trajectory to use (0 = first window)
     """
-    K = 8   # number of outputs
+    K = 5   # number of outputs
     
     feature_cols = ["x", "y", "speed", "orientation"]
     seq_len = obs_len + pred_len

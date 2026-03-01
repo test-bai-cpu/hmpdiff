@@ -18,17 +18,9 @@ import train_utils
 
 from mod.mod_inference import load_mod_model, load_mod_feature_model
 
-# version = "v4"
-# version = "v5-ep100"
-# version = "v6-20"
-# version = "v7-20-k"
-# version = "v7-20-k-mod-div"
-# version = "v8-20-k-mod"
-# version = "v8-20-k-gt"
-# version = "full-v8-20-k-gt-sigma0.2"
-# version = "full-v8-20-k-mod-sigma0.2"
-# version = "full-v8-20-k-mod"
-version = "full-v8-20-k-gt"
+version = "V2-fix-t-pred20-sigma0.2-utTrue-modFalse-divTrue-smoothTrue"
+# version = "V2-fix-t-pred20-sigma0.2-utTrue-modTrue-divTrue-smoothTrue"
+print("Evaluating version:", version)
 
 # =========================
 # Dataset

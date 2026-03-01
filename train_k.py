@@ -54,16 +54,14 @@ obs_len = 4
 # pred_len = 20
 stride = pred_len // 2
 coord_dim = 2
-n_epochs = 200
-# sigma = 0.2
-# sigma = 0.0
+n_epochs = 100
 
 ##### for generating k samples #####
 K = 5
 lambda_gt = 1.0
-lambda_mod = 1e-3
-lambda_smooth = 1e-3
-lambda_div = 1e-3
+lambda_mod = 1e-2
+lambda_smooth = 1e-1
+lambda_div = 1e-1
 
 
 train_utils.set_random_seed(42)
@@ -128,10 +126,10 @@ for epoch in range(1, n_epochs+1):
         x1_flat = x1[:, None].expand(B, K, D).reshape(B*K, D)
         X_obs_flat = X_obs[:, None].expand(B, K, *X_obs.shape[1:]).reshape(B*K, *X_obs.shape[1:])
 
-        # Sample (t, x_t, u_t) for all B*K
+        # Sample (t, x_t, u_t) for all B*K, K has same t
         # t, x_t, u_t = FM.sample_location_and_conditional_flow(x0_flat, x1_flat)
-        # t = torch.rand(B*K, device=device) * 0.999
-        t = torch.rand(B*K, device=device)
+        t_sample = torch.rand(B, device=device) * 0.99 # (B,)
+        t = t_sample[:, None].expand(B, K).reshape(B*K)             # (B*K,) — same t for all K
         
         ######## Use sigma ################################
         if if_ut:
@@ -155,7 +153,9 @@ for epoch in range(1, n_epochs+1):
         gt_mse = (x1_pred - x1[:, None]).pow(2).mean(dim=-1)  # (B, K)
         k_star = gt_mse.argmin(dim=1)     # (B,)
         x1_star = x1_pred[torch.arange(B, device=device), k_star] # (B, D)
-        L_gt = (x1_star - x1).pow(2).mean()
+
+        raw_mse = (x1_star - x1).pow(2).mean(dim=-1)           # (B,)
+        L_gt = (raw_mse / (1 - t_sample).clamp(min=1e-2).pow(2)).mean()  # scalar
         
         # MoD loss
         y_pred = x1_pred.view(B, K, pred_len, 2)          # (B,K,T,2)
@@ -204,7 +204,7 @@ for epoch in range(1, n_epochs+1):
         # loss = lambda_gt * L_gt + lambda_smooth * L_smooth + lambda_mod * L_mod + lambda_div * L_div + L_anchor
         loss = lambda_gt * L_gt + (lambda_smooth * L_smooth if if_smooth else 0) + (lambda_mod * L_mod if if_mod else 0) + (lambda_div * L_div if if_div else 0)
         # print("loss components includes: if_mod ", if_mod, ", if_div ", if_div, ", if_smooth ", if_smooth)
-        
+        # print("train loss values are: L_gt ", L_gt.item(), ", L_mod ", L_mod.item(), ", L_div ", L_div.item(), ", L_smooth ", L_smooth.item(), ", L_anchor ", L_anchor.item())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -241,11 +241,11 @@ for epoch in range(1, n_epochs+1):
             x0_flat = x0.reshape(B*K, D)
             x1_flat = x1[:, None].expand(B, K, D).reshape(B*K, D)
             X_obs_flat = X_obs[:, None].expand(B, K, *X_obs.shape[1:]).reshape(B*K, *X_obs.shape[1:])
-
-            # Sample (t, x_t, u_t) for all B*K
+            
+            # Sample (t, x_t, u_t) for all B*K, K has same t
             # t, x_t, u_t = FM.sample_location_and_conditional_flow(x0_flat, x1_flat)
-            # t, x_t, u_t = t.to(device), x_t.to(device), u_t.to(device)
-            t = torch.rand(B*K, device=device)
+            t_sample = torch.rand(B, device=device) * 0.99 # (B,)
+            t = t_sample[:, None].expand(B, K).reshape(B*K)             # (B*K,) — same t for all K
             
             ######## Use sigma ################################
             if if_ut:
@@ -268,7 +268,9 @@ for epoch in range(1, n_epochs+1):
             gt_mse = (x1_pred - x1[:, None]).pow(2).mean(dim=-1)  # (B, K)
             k_star = gt_mse.argmin(dim=1)     # (B,)
             x1_star = x1_pred[torch.arange(B, device=device), k_star] # (B, D)
-            L_gt = (x1_star - x1).pow(2).mean()
+            
+            raw_mse = (x1_star - x1).pow(2).mean(dim=-1)           # (B,)
+            L_gt = (raw_mse / (1 - t_sample).clamp(min=1e-2).pow(2)).mean()  # scalar
             
             # MoD loss
             y_pred = x1_pred.view(B, K, pred_len, 2)          # (B,K,T,2)
@@ -317,6 +319,8 @@ for epoch in range(1, n_epochs+1):
             # loss = lambda_gt * L_gt + lambda_smooth * L_smooth + lambda_mod * L_mod + lambda_div * L_div + L_anchor
             loss = lambda_gt * L_gt + (lambda_smooth * L_smooth if if_smooth else 0) + (lambda_mod * L_mod if if_mod else 0) + (lambda_div * L_div if if_div else 0)
 
+            # print("val loss values are: L_gt ", L_gt.item(), ", L_mod ", L_mod.item(), ", L_div ", L_div.item(), ", L_smooth ", L_smooth.item(), ", L_anchor ", L_anchor.item())
+            
             val_loss_acc += loss * X_obs.size(0)
     
     val_loss = (val_loss_acc / len(val_loader.dataset)).item()
