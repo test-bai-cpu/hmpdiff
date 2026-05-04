@@ -28,44 +28,42 @@ import train_utils
 param_setup_v = sys.argv[1]
 pred_len = int(sys.argv[2])
 sigma = float(sys.argv[3])
-if_ut = bool(int(sys.argv[4]))
-if_mod = bool(int(sys.argv[5]))
-if_div = bool(int(sys.argv[6]))
-if_smooth = bool(int(sys.argv[7]))
+if_mod = bool(int(sys.argv[4]))
+K = int(sys.argv[5])
+lambda_mod = float(sys.argv[6])
 
-version = f"V{param_setup_v}-pred{pred_len}-sigma{sigma}-ut{if_ut}-mod{if_mod}-div{if_div}-smooth{if_smooth}"
-
-# version = "v8-20-k-mod"
-# version = "full-v8-20-k-gt-sigma0.2"
-# version = "full-v8-20-k-mod"
-# version = "full-v8-20-k-mod-sigma0.2"
-# version = "full-v8-20-k-gt"
-# version = "v7-20-k-gt-smooth"
+# version = f"V{param_setup_v}-pred{pred_len}-sigma{sigma}-ut{if_ut}-mod{if_mod}-div{if_div}-smooth{if_smooth}"
+version = f"V{param_setup_v}-pred{pred_len}-sigma{sigma}-mod{if_mod}-K{K}-lambdaMod{lambda_mod}"
 checkpoint_dir = f"checkpoints/{version}"
 os.makedirs(checkpoint_dir, exist_ok=True)
 log_dir = f"runs/{version}"
 os.makedirs(log_dir, exist_ok=True)
 writer = SummaryWriter(log_dir=log_dir)
 
-# debug = True
 debug = False
 
 obs_len = 4
-# pred_len = 20
 stride = pred_len // 2
 coord_dim = 2
 n_epochs = 100
 
 ##### for generating k samples #####
-K = 5
 lambda_gt = 1.0
-lambda_mod = 1e-2
-lambda_smooth = 1e-1
-lambda_div = 1e-1
-
+lambda_smooth = 1e-2
 
 train_utils.set_random_seed(42)
 device = torch.device('cuda')
+
+### print all config for logging
+print("Experiment version:", version)
+print("Config:")
+print(f"  pred_len: {pred_len}")
+print(f"  sigma: {sigma}")
+print(f"  if_mod: {if_mod}")
+print(f"  K: {K}")
+print(f"  lambda_gt: {lambda_gt}")
+print(f"  lambda_mod: {lambda_mod}")
+print(f"  lambda_smooth: {lambda_smooth}")
 
 
 # =========================
@@ -128,17 +126,18 @@ for epoch in range(1, n_epochs+1):
 
         # Sample (t, x_t, u_t) for all B*K, K has same t
         # t, x_t, u_t = FM.sample_location_and_conditional_flow(x0_flat, x1_flat)
-        t_sample = torch.rand(B, device=device) * 0.99 # (B,)
+        # t_sample = torch.rand(B, device=device) * 0.99 # (B,)
+        t_sample = train_utils.sample_t_logit_normal(B, device=device, mu_t=-0.5, sigma_t=1.5)
         t = t_sample[:, None].expand(B, K).reshape(B*K)             # (B*K,) — same t for all K
         
         ######## Use sigma ################################
-        if if_ut:
-            mu_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
-            x_t = mu_t + sigma * torch.randn_like(mu_t)
-            # print(f"ut is true, using sigma {sigma} for sampling x_t")
+        # if if_ut:
+        mu_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
+        x_t = mu_t + sigma * torch.randn_like(mu_t)
+        # print(f"ut is true, using sigma {sigma} for sampling x_t")
         ######## Or without sigma, just straight interpolation ########
-        else:
-            x_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
+        # else:
+        #     x_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
         #########################################################
         
         u_t = x1_flat - x0_flat
@@ -179,30 +178,26 @@ for epoch in range(1, n_epochs+1):
         L_mod = L_mod_bk.mean() # mean over batch and K.
 
         # y_pred: (B,K,T,2)
-        y_centered = y_pred - y_pred[:, :, :1, :]          # (B,K,T,2) starts at 0
-        y_flat = y_centered.reshape(B, K, -1)  # (B,K,2T)
+        # y_centered = y_pred - y_pred[:, :, :1, :]          # (B,K,T,2) starts at 0
+        # y_flat = y_centered.reshape(B, K, -1)  # (B,K,2T)
 
-        # pairwise distances
-        diff = y_flat[:, :, None, :] - y_flat[:, None, :, :]      # (B,K,K,2T)
-        dist2 = (diff**2).mean(dim=-1)                            # (B,K,K)
-        mask = ~torch.eye(K, device=device, dtype=torch.bool)          # (K,K)
-        mask = mask.unsqueeze(0).expand(B, K, K)                       # (B,K,K)
-        dist2_off = dist2[mask].view(B, K*(K-1))            # off-diagonal only
-        L_div = torch.exp(-dist2_off / 0.1).mean()
+        # # pairwise distances
+        # diff = y_flat[:, :, None, :] - y_flat[:, None, :, :]      # (B,K,K,2T)
+        # dist2 = (diff**2).mean(dim=-1)                            # (B,K,K)
+        # mask = ~torch.eye(K, device=device, dtype=torch.bool)          # (K,K)
+        # mask = mask.unsqueeze(0).expand(B, K, K)                       # (B,K,K)
+        # dist2_off = dist2[mask].view(B, K*(K-1))            # off-diagonal only
+        # L_div = torch.exp(-dist2_off / 0.1).mean()
 
-        #smooth loss # OPTIONS: can be change to all K samples instead of just the best one
-        # y_star = x1_star.view(B, pred_len, 2)
-        # vel = y_star[:, 1:] - y_star[:, :-1]
-        # acc = vel[:, 1:] - vel[:, :-1]
-        # L_smooth = acc.pow(2).mean()
-        
+        #smooth loss       
         y_all = x1_pred.view(B, K, pred_len, 2)         # (B,K,T,2)
         vel = y_all[:, :, 1:] - y_all[:, :, :-1]        # (B,K,T-1,2)
         acc = vel[:, :, 1:] - vel[:, :, :-1]            # (B,K,T-2,2)
         L_smooth = acc.pow(2).mean()
 
         # loss = lambda_gt * L_gt + lambda_smooth * L_smooth + lambda_mod * L_mod + lambda_div * L_div + L_anchor
-        loss = lambda_gt * L_gt + (lambda_smooth * L_smooth if if_smooth else 0) + (lambda_mod * L_mod if if_mod else 0) + (lambda_div * L_div if if_div else 0)
+        # loss = lambda_gt * L_gt + (lambda_smooth * L_smooth if if_smooth else 0) + (lambda_mod * L_mod if if_mod else 0) + (lambda_div * L_div if if_div else 0)
+        loss = lambda_gt * L_gt + lambda_smooth * L_smooth + (lambda_mod * L_mod if if_mod else 0)
         # print("loss components includes: if_mod ", if_mod, ", if_div ", if_div, ", if_smooth ", if_smooth)
         # print("train loss values are: L_gt ", L_gt.item(), ", L_mod ", L_mod.item(), ", L_div ", L_div.item(), ", L_smooth ", L_smooth.item(), ", L_anchor ", L_anchor.item())
         optimizer.zero_grad()
@@ -244,16 +239,17 @@ for epoch in range(1, n_epochs+1):
             
             # Sample (t, x_t, u_t) for all B*K, K has same t
             # t, x_t, u_t = FM.sample_location_and_conditional_flow(x0_flat, x1_flat)
-            t_sample = torch.rand(B, device=device) * 0.99 # (B,)
+            # t_sample = torch.rand(B, device=device) * 0.99 # (B,)
+            t_sample = train_utils.sample_t_logit_normal(B, device=device, mu_t=-0.5, sigma_t=1.5)
             t = t_sample[:, None].expand(B, K).reshape(B*K)             # (B*K,) — same t for all K
             
             ######## Use sigma ################################
-            if if_ut:
-                mu_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
-                x_t = mu_t + sigma * torch.randn_like(mu_t)
+            # if if_ut:
+            mu_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
+            x_t = mu_t + sigma * torch.randn_like(mu_t)
             ######## Or without sigma, just straight interpolation ########
-            else:
-                x_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
+            # else:
+            #     x_t = x0_flat + t[:, None] * (x1_flat - x0_flat)
             #########################################################
             
             u_t = x1_flat - x0_flat
@@ -294,31 +290,17 @@ for epoch in range(1, n_epochs+1):
             L_mod = L_mod_bk.mean() # mean over batch and K.
 
             # y_pred: (B,K,T,2)
-            y_centered = y_pred - y_pred[:, :, :1, :]          # (B,K,T,2) starts at 0
-            y_flat = y_centered.reshape(B, K, -1)  # (B,K,2T)
+            # y_centered = y_pred - y_pred[:, :, :1, :]          # (B,K,T,2) starts at 0
+            # y_flat = y_centered.reshape(B, K, -1)  # (B,K,2T)
 
-            # pairwise distances
-            diff = y_flat[:, :, None, :] - y_flat[:, None, :, :]      # (B,K,K,2T)
-            dist2 = (diff**2).mean(dim=-1)                            # (B,K,K)
-            mask = ~torch.eye(K, device=device, dtype=torch.bool)          # (K,K)
-            mask = mask.unsqueeze(0).expand(B, K, K)                       # (B,K,K)
-            dist2_off = dist2[mask].view(B, K*(K-1))            # off-diagonal only
-            L_div = torch.exp(-dist2_off / 0.1).mean()                              # minimize => push apart
-
-            #smooth loss # OPTIONS: can be change to all K samples instead of just the best one
-            # y_star = x1_star.view(B, pred_len, 2)
-            # vel = y_star[:, 1:] - y_star[:, :-1]
-            # acc = vel[:, 1:] - vel[:, :-1]
-            # L_smooth = acc.pow(2).mean()
-            
+            #smooth loss
             y_all = x1_pred.view(B, K, pred_len, 2)         # (B,K,T,2)
             vel = y_all[:, :, 1:] - y_all[:, :, :-1]        # (B,K,T-1,2)
             acc = vel[:, :, 1:] - vel[:, :, :-1]            # (B,K,T-2,2)
             L_smooth = acc.pow(2).mean()
 
-            # loss = lambda_gt * L_gt + lambda_smooth * L_smooth + lambda_mod * L_mod + lambda_div * L_div + L_anchor
-            loss = lambda_gt * L_gt + (lambda_smooth * L_smooth if if_smooth else 0) + (lambda_mod * L_mod if if_mod else 0) + (lambda_div * L_div if if_div else 0)
-
+            # loss = lambda_gt * L_gt + (lambda_smooth * L_smooth if if_smooth else 0) + (lambda_mod * L_mod if if_mod else 0) + (lambda_div * L_div if if_div else 0)
+            loss = lambda_gt * L_gt + lambda_smooth * L_smooth + (lambda_mod * L_mod if if_mod else 0)
             # print("val loss values are: L_gt ", L_gt.item(), ", L_mod ", L_mod.item(), ", L_div ", L_div.item(), ", L_smooth ", L_smooth.item(), ", L_anchor ", L_anchor.item())
             
             val_loss_acc += loss * X_obs.size(0)
