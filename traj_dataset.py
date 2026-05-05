@@ -39,9 +39,72 @@ class TrajectoryDataset(Dataset):
         """
         df_norm = normalize_df_min_max(df, min, max)
         X, Y, epoch_time = build_sequences_from_df(df_norm, obs_len=obs_len, pred_len=pred_len, stride=stride)
+        # X = add_velocity_features(X)
         ds = cls(X, Y, epoch_time)
         
         return ds
+
+def train_val_test_split_by_person_set_frame(
+    df: pd.DataFrame,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    obs_len: int = 4,
+    pred_len: int = 60,
+    seed: int = 0,
+    debug: bool = False,
+):
+    """
+    Split df into train/val/test by person_id (no leakage).
+    """
+    
+    df = df.copy()
+    min_traj_len = obs_len + pred_len
+    counts = df.groupby("person_id").size()
+    valid_ids = counts[counts >= min_traj_len].index.values
+    df = df[df["person_id"].isin(valid_ids)]
+    
+    ##### keep the person ids with continous moving traj, removing the ones with idling behavior #####
+    keep_ids = []
+    for pid, g in df.groupby("person_id"):
+        # Sort by time to ensure correct temporal order
+        g_sorted = g.sort_values("epoch_time")
+        if has_continuous_motion(g_sorted):
+            keep_ids.append(pid)
+    df = df[df["person_id"].isin(keep_ids)]
+
+    print(f"[split] Keeping {len(keep_ids)} persons with >= {min_traj_len} steps and continuous motion.")
+
+    t0 = df["epoch_time"].min()
+    df["frame"] = (df["epoch_time"] - t0).round().astype(int)
+    df.drop(columns=["epoch_time"], inplace=True)
+
+
+    rng = np.random.RandomState(seed)
+    persons = df["person_id"].unique()
+    rng.shuffle(persons)
+    n_total = len(persons)
+
+    # ---- DEBUG mode here ----
+    if debug == True:
+        k = max(1, int(n_total * 0.3))   # use only 30% of persons
+        persons = persons[:k]
+        print(f"[Debug mode] Using only fraction={0.3:.2f} -> {k} persons.")
+    # --------------------------------
+
+    n_total = len(persons)
+    n_test = int(n_total * test_ratio)
+    n_val = int(n_total * val_ratio)
+
+    test_ids = persons[:n_test]
+    val_ids = persons[n_test:n_test + n_val]
+    train_ids = persons[n_test + n_val:]
+
+    df_train = df[df["person_id"].isin(train_ids)].copy()
+    df_val   = df[df["person_id"].isin(val_ids)].copy()
+    df_test  = df[df["person_id"].isin(test_ids)].copy()
+
+    return df_train, df_val, df_test
+
 
 def train_val_test_split_by_person(
     df: pd.DataFrame,
@@ -300,3 +363,20 @@ def has_continuous_motion(
     if np.any(dist < idle_threshold):
         return False    # has idle, reject this person
     return True         # no idle detected, keep this person
+
+
+def add_velocity_features(X: np.ndarray) -> np.ndarray:
+    """
+    Replace speed/orientation with vel_x, vel_y.
+    
+    X: (N, obs_len, 4) with [x, y, speed, orientation]
+    
+    Returns:
+        X_new: (N, obs_len, 4) with [x, y, vel_x, vel_y]
+    """
+    xy = X[:, :, :2]                                    # (N, obs_len, 2)
+    vel = np.zeros_like(xy)                              # (N, obs_len, 2)
+    vel[:, 1:, :] = xy[:, 1:, :] - xy[:, :-1, :]       # finite differences
+    
+    X_new = np.concatenate([xy, vel], axis=-1)           # (N, obs_len, 4)
+    return X_new

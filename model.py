@@ -12,6 +12,28 @@ import sys
 from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalFlowMatcher
 from torchcfm.models.basic_transformer.transformer import VisionTransformerCFMWrapper
 
+import math
+
+class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal positional embedding for scalar time, following MoFlow."""
+    def __init__(self, dim: int, theta: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) -> (B, dim)"""
+        device = t.device
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(self.theta) * torch.arange(half, device=device).float() / half
+        )
+        args = t[:, None].float() * freqs[None, :]
+        emb = torch.cat([args.cos(), args.sin()], dim=-1)
+        if self.dim % 2:
+            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+        return emb
+    
 
 class TrajectoryCFMMLP(nn.Module):
     def __init__(self, history_dim: int, future_dim: int, hidden_dim: int = 512, num_layers: int = 4):
@@ -197,3 +219,204 @@ class TrajectoryCFMModel_v2(nn.Module):
         inp = torch.cat([x_t, h, t_emb], dim=-1)
         x1_pred = self.data_head(inp)           # (B,D)  <- predicted clean trajectory
         return x1_pred
+    
+
+class TrajectoryCFMModel_v3(nn.Module):
+    """
+    Transformer-based conditional flow matching model for trajectory prediction.
+    Adapted from MoFlow's ETHMotionTransformer for single-agent setting.
+ 
+    Inputs (K-aware):
+        x_t:    (B, K, D)           noisy trajectories at flow time τ
+        t:      (B,)                flow time (shared across K)
+        X_obs:  (B, obs_len, 4)     observed past trajectory
+ 
+    Output:
+        x1_pred: (B, K, D)          predicted clean trajectories
+    """
+ 
+    def __init__(
+        self,
+        obs_len: int = 4,
+        pred_len: int = 60,
+        K: int = 5,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_decoder_layers: int = 3,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+        past_hidden_dim: int = 64,
+        past_out_dim: int = 128,
+    ):
+        super().__init__()
+        self.pred_len = pred_len
+        self.K = K
+        self.D = pred_len * 2
+        self.d_model = d_model
+ 
+        # ---- Past encoder (GRU, same as v2) ----
+        self.past_encoder = PastEncoder(
+            in_dim=4, hidden_dim=past_hidden_dim, out_dim=past_out_dim
+        )
+        # project encoder output to d_model
+        self.past_proj = nn.Linear(past_out_dim, d_model)
+ 
+        # ---- Time embedding (sinusoidal, like MoFlow) ----
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(d_model, theta=10000),
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+ 
+        # ---- Noisy trajectory embedding ----
+        # Each timestep (x, y) -> d_model token
+        self.noisy_y_mlp = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+ 
+        # ---- Temporal positional encoding (learned, for pred_len positions) ----
+        self.temporal_pe = nn.Embedding(pred_len, d_model)
+ 
+        # ---- K-sample query embedding (like motion_query_embedding in MoFlow) ----
+        self.k_query_emb = nn.Embedding(K, d_model)
+ 
+        # ---- Cross-K self-attention (like noisy_y_attn_k in MoFlow) ----
+        self.attn_across_k = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward, dropout=dropout,
+            batch_first=True,
+        )
+ 
+        # ---- Cross-time self-attention (replaces agent-attention in MoFlow) ----
+        self.attn_across_t = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward, dropout=dropout,
+            batch_first=True,
+        )
+ 
+        # ---- Fusion MLP: concat(encoder_out, y_emb, t_emb) -> d_model ----
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(d_model + d_model + d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+ 
+        # ---- Transformer decoder ----
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward, dropout=dropout,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+ 
+        # ---- Readout: token -> (x, y) per timestep ----
+        self.readout_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 2),
+        )
+ 
+        self._init_weights()
+ 
+    def _init_weights(self):
+        """Light Xavier init for linear layers."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+ 
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        X_obs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_t:   (B, K, D)  or  (B, D)  — noisy trajectories
+            t:     (B,)                    — flow time
+            X_obs: (B, obs_len, 4)         — observed past
+ 
+        Returns:
+            x1_pred: same shape as x_t     — predicted clean trajectories
+        """
+        # Handle flat (B, D) input for backward compatibility
+        squeezed = False
+        if x_t.dim() == 2:
+            x_t = x_t.unsqueeze(1)   # (B, 1, D)
+            squeezed = True
+ 
+        B, K, D = x_t.shape
+        T = self.pred_len
+        device = x_t.device
+ 
+        # --- 1. Encode past ---
+        h_past = self.past_encoder(X_obs)           # (B, past_out_dim)
+        h_past = self.past_proj(h_past)             # (B, d_model)
+ 
+        # --- 2. Time embedding ---
+        # MoFlow scales flow time by 1000 for sinusoidal embedding
+        t_emb = self.time_mlp(t * 1000.0)           # (B, d_model)
+ 
+        # --- 3. Noisy trajectory -> per-timestep tokens ---
+        y = x_t.view(B, K, T, 2)                    # (B, K, T, 2)
+        y_emb = self.noisy_y_mlp(y)                 # (B, K, T, d_model)
+ 
+        # Add temporal positional encoding
+        t_pos = self.temporal_pe(torch.arange(T, device=device))  # (T, d_model)
+        y_emb = y_emb + t_pos[None, None, :, :]     # broadcast over B, K
+ 
+        # Add K-query embedding
+        k_pos = self.k_query_emb(torch.arange(K, device=device))  # (K, d_model)
+        y_emb = y_emb + k_pos[None, :, None, :]     # broadcast over B, T
+ 
+        # --- 4. Attention across K (like MoFlow's noisy_y_attn_k) ---
+        # Reshape: treat each (B, T) position independently, attend over K
+        y_k = y_emb.permute(0, 2, 1, 3).reshape(B * T, K, self.d_model)  # (B*T, K, d)
+        y_k = self.attn_across_k(y_k)
+        y_emb = y_k.reshape(B, T, K, self.d_model).permute(0, 2, 1, 3)   # (B, K, T, d)
+ 
+        # --- 5. Attention across time (like MoFlow's noisy_y_attn_a, but over T) ---
+        y_t = y_emb.reshape(B * K, T, self.d_model)  # (B*K, T, d)
+        y_t = self.attn_across_t(y_t)
+        y_emb = y_t.reshape(B, K, T, self.d_model)   # (B, K, T, d)
+ 
+        # --- 6. Fuse context: encoder + noisy_y + time ---
+        # Expand h_past and t_emb to (B, K, T, d_model)
+        h_past_exp = h_past[:, None, None, :].expand(B, K, T, self.d_model)
+        t_emb_exp = t_emb[:, None, None, :].expand(B, K, T, self.d_model)
+ 
+        fused = self.fusion_mlp(
+            torch.cat([h_past_exp, y_emb, t_emb_exp], dim=-1)
+        )  # (B, K, T, d_model)
+ 
+        # Re-add positional encodings (like MoFlow's post_pe_cat_mlp)
+        fused = fused + t_pos[None, None, :, :] + k_pos[None, :, None, :]
+ 
+        # --- 7. Transformer decoder ---
+        # Query: fused tokens (B*K, T, d)
+        # Memory: past context as a single token (B*K, 1, d)
+        query = fused.reshape(B * K, T, self.d_model)
+        memory = h_past[:, None, :].expand(B, K, self.d_model).reshape(B * K, 1, self.d_model)
+        # Add time info to memory
+        t_mem = t_emb[:, None, :].expand(B, K, self.d_model).reshape(B * K, 1, self.d_model)
+        memory = memory + t_mem
+ 
+        decoded = self.decoder(query, memory)         # (B*K, T, d_model)
+ 
+        # --- 8. Readout ---
+        out = self.readout_mlp(decoded)               # (B*K, T, 2)
+        x1_pred = out.reshape(B, K, T, 2).reshape(B, K, D)  # (B, K, D)
+ 
+        if squeezed:
+            x1_pred = x1_pred.squeeze(1)              # (B, D)
+ 
+        return x1_pred
+ 

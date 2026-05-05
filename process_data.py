@@ -22,9 +22,10 @@ df["orientation"] = df["orientation"] % (2 * np.pi)
 
 # ---------- Save processed splits ----------
 obs_len = 4
-pred_len = 60
+pred_len = 10
 debug = False
-df_train, df_val, df_test = traj_dataset.train_val_test_split_by_person(df, val_ratio=0.1, test_ratio=0.1, obs_len=obs_len, pred_len=pred_len, seed=42, debug=debug)
+# df_train, df_val, df_test = traj_dataset.train_val_test_split_by_person(df, val_ratio=0.1, test_ratio=0.1, obs_len=obs_len, pred_len=pred_len, seed=42, debug=debug)
+df_train, df_val, df_test = traj_dataset.train_val_test_split_by_person_set_frame(df, val_ratio=0.1, test_ratio=0.1, obs_len=obs_len, pred_len=pred_len, seed=42, debug=debug)
 
 if debug:
     folder = f"debug_{pred_len}"
@@ -33,7 +34,13 @@ if debug:
     df_val.to_parquet(f"dataset/atc/{folder}/atc1_val_split.parquet")
     df_test.to_parquet(f"dataset/atc/{folder}/atc1_test_split.parquet")
 else:
-    folder = f"full_{pred_len}"
+    # folder = f"full_{pred_len}"
+    # os.makedirs(f"dataset/atc/{folder}", exist_ok=True)
+    # df_train.to_parquet(f"dataset/atc/{folder}/atc1_train_split.parquet")
+    # df_val.to_parquet(f"dataset/atc/{folder}/atc1_val_split.parquet")
+    # df_test.to_parquet(f"dataset/atc/{folder}/atc1_test_split.parquet")
+    
+    folder = f"full_frame_{pred_len}"
     os.makedirs(f"dataset/atc/{folder}", exist_ok=True)
     df_train.to_parquet(f"dataset/atc/{folder}/atc1_train_split.parquet")
     df_val.to_parquet(f"dataset/atc/{folder}/atc1_val_split.parquet")

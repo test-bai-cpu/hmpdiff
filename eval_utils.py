@@ -41,6 +41,10 @@ def  evaluate_cfm(
     all_min_ade_mod = []
     all_min_fde_mod = []
     all_avg_mod_score = []
+    
+    all_masd = []
+    all_avar = []
+    all_fvar = []
 
     # all_ade = []
     # all_fde = []
@@ -92,6 +96,7 @@ def  evaluate_cfm(
         # )                                 # (B, pred_len, 2)
 
         Yk_pred_norm = sample_future_cfm_euler_k(
+        # Yk_pred_norm = sample_future_cfm_euler_k_transformer(
             model,
             X_obs,
             pred_len=pred_len,
@@ -127,6 +132,10 @@ def  evaluate_cfm(
         avg_ade = ade_k.mean(dim=1)     # (B,)
         avg_fde = fde_k.mean(dim=1)     # (B,)
         avg_mod_score = mod_score_k.mean(dim=1)  # (B,)
+        
+        masd = get_masd(Yk_pred_real)  # (B,)
+        avar, fvar = get_trajectory_var(Yk_pred_real) # (B,), (B,)
+        
         all_min_ade.append(min_ade.cpu())
         all_min_fde.append(min_fde.cpu())
         all_avg_ade.append(avg_ade.cpu())
@@ -134,6 +143,10 @@ def  evaluate_cfm(
         all_min_ade_mod.append(ade_min_mod.cpu())
         all_min_fde_mod.append(fde_min_mod.cpu())
         all_avg_mod_score.append(avg_mod_score.cpu())
+        
+        all_masd.append(masd.cpu())
+        all_avar.append(avar.cpu())
+        all_fvar.append(fvar.cpu())
 
         # 2) Compute difference for 1 output traj
         # diff_norm = Y_pred_norm - Y_true_norm    # (B, pred_len, 2)
@@ -162,6 +175,11 @@ def  evaluate_cfm(
     modFDE = torch.cat(all_min_fde_mod).mean().item()
     mod_score = torch.cat(all_avg_mod_score).mean().item()
     
+    masd_value = torch.cat(all_masd).mean().item()
+    avar_value = torch.cat(all_avar).mean().item()
+    fvar_value = torch.cat(all_fvar).mean().item()
+    
+    
     all_ade = torch.cat(all_min_ade).cpu().numpy()
     all_fde = torch.cat(all_min_fde).cpu().numpy()
 
@@ -172,8 +190,85 @@ def  evaluate_cfm(
     print(f"ADE_mod@{K}: {modADE:.4f}")
     print(f"FDE_mod@{K}: {modFDE:.4f}")
     print(f"avg_mod_score@{K}: {mod_score:.4f}")
+    
+    print(f"MASD@{K}: {masd_value:.4f}")
+    print(f"Average variance across trajectory (avar)@{K}: {avar_value:.4f}")
+    print(f"Final variance (fvar)@{K}: {fvar_value:.4f}")
+    
+    print("number of persons in test set:", all_ade.shape)
 
     return all_ade, all_fde
+
+@torch.no_grad()
+def sample_future_cfm_euler_k_transformer(
+    model: nn.Module,
+    X_obs: torch.Tensor,
+    pred_len: int,
+    K: int = 8,
+    n_steps: int = 32,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Generate K future trajectories from the trained CFM model (parallel).
+
+    Returns:
+        Y_pred_norm: (B, K, pred_len, 2)
+    """
+    model.eval()
+    X_obs = X_obs.to(device)
+    B = X_obs.size(0)
+    D = pred_len * 2
+
+    # sample x0 for all hypotheses
+    eps = torch.randn(B, K, pred_len, 2, device=device)
+    eps = torch.cumsum(eps, dim=2)
+    eps = eps / eps.abs().amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+    x_t = eps.view(B, K, D)  # (B, K, D)
+
+    ts = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=device)
+    dt = ts[1] - ts[0]
+
+    for k in range(n_steps):
+        t_k = ts[k].item()
+        t_batch = torch.full((B,), t_k, device=device, dtype=x_t.dtype)  # (B,) not (B*K,)
+
+        x1_pred = model(x_t, t_batch, X_obs)  # (B, K, D)
+        denom = max(1.0 - t_k, 1e-3)
+        v = (x1_pred - x_t) / denom
+        x_t = x_t + dt * v
+
+    Y_pred_norm = x_t.view(B, K, pred_len, 2)
+    return Y_pred_norm
+
+def get_masd(Yk_pred_real):
+    """
+    Compute MASD (map-aware self-distance) for a set of predicted trajectories.
+
+    Yk_pred_real: (B, K, T, 2)
+
+    Returns:
+        masd: (B,) average pairwise distance between the K trajectories
+    """
+    predictions = Yk_pred_real.permute(0, 2, 1, 3)  # (B, T, K, 2)
+    pairwise_distances = torch.cdist(predictions, predictions, p=2)  # (B, T, K, K)
+    max_dist = pairwise_distances.max(dim=-1)[0].max(dim=-1)[0]  # (B, T)
+    masd = max_dist.mean(dim=-1)  # (B,)
+    return masd
+
+def get_trajectory_var(Yk_pred_real):
+    """
+    Compute variance of predicted trajectories across K samples.
+
+    Yk_pred_real: (B, K, T, 2)
+
+    Returns:
+        avar: (B,) average variance across all time steps and dimensions
+        fvar: (B,) variance at the final time step
+    """
+    a_var = Yk_pred_real.var(dim=(1, 3)).mean(dim=1)  # (B,)
+    f_var = Yk_pred_real[:, :, -1, :].var(dim=(1, 2))  # (B,)
+    return a_var, f_var
+
 
 
 @torch.no_grad()
@@ -556,8 +651,13 @@ def plot_person_from_df(
     """
     K = 5   # number of outputs
     
+    
     feature_cols = ["x", "y", "speed", "orientation"]
     seq_len = obs_len + pred_len
+    
+    #if frame column is in df, we rename it to epoch_time for consistency
+    if "frame" in df.columns:
+        df = df.rename(columns={"frame": "epoch_time"})
         
     # 1) Extract this person's full trajectory from df (raw, unnormalized)
     g = df[df["person_id"] == person_id].sort_values("epoch_time").reset_index(drop=True)
@@ -638,6 +738,15 @@ def plot_person_from_df(
     print(f"[Person {person_id}] minADE@{K}={ades[best_k]:.4f}, minFDE@{K}={fdes[best_k]:.4f} (best_k={best_k})")
     ##############################
     
+    
+    # ##### for multiple output, get the mod score ######
+    # mod_score_k  = get_mod_score(Yk_pred_real, mod_model)
+    # best_k_mod = int(np.argmin(mod_score_k))
+    # print(f"[Person {person_id}] best_k_mod={best_k_mod}, mod_score={mod_score_k[best_k_mod]:.4f}, ADE={ades[best_k_mod]:.4f}, FDE={fdes[best_k_mod]:.4f}")
+    # ###################################################
+    
+    
+    
     ##### for single output #####
     # Y_pred_real = denormalize_positions(Y_pred_norm[0].cpu().numpy(), min, max)    # (pred_len, 2)
     # diff = Y_pred_real - future_real                            # (pred_len, 2)
@@ -650,20 +759,23 @@ def plot_person_from_df(
 
     plt.clf()
     plt.close('all')
-    plt.figure(figsize=(6, 6))
-    plt.plot(observed_real[:, 0], observed_real[:, 1], "o-g", label="Observed (past)")
-    plt.plot(future_real[:, 0],   future_real[:, 1],   "o-r", label="GT future")
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=200)
+    ax.set_facecolor('white')
+    img = plt.imread("map/atc/localization_grid_white.jpg")
+    ax.imshow(img, cmap='gray', vmin=0, vmax=255, extent=[-60, 80, -40, 20])
+    ax.plot(observed_real[:, 0], observed_real[:, 1], "o-g", markersize=4, label="Observed (past)")
+    last_obs = observed_real[-1:, :2]  # shape (1, 2)
+    future_connected = np.concatenate([last_obs, future_real[:, :2]], axis=0)
+    ax.plot(future_connected[:, 0], future_connected[:, 1], "o-r", markersize=4, label="GT future")
+
     
     # plt.plot(Y_pred_real[:, 0],   Y_pred_real[:, 1],   "o-b", label="Pred future")
     
     for k in range(K):
-        # if k != 1:
-        #     continue
-        
         y = Yk_pred_real[k]
-        # if k == best_k:
-        #     continue
-        plt.plot(y[:, 0], y[:, 1], "o-b", alpha=0.35, label=f"Pred future")
+        y_connected = np.concatenate([last_obs, y[:, :2]], axis=0)
+        ax.plot(y_connected[:, 0], y_connected[:, 1], "o-b", alpha=0.35, markersize=3,
+                label="Pred future" if k == 0 else None)
         
     
     # # Plotting the normalized version
@@ -683,13 +795,36 @@ def plot_person_from_df(
     #     label="Anchor (last obs)",
     # )
 
-    plt.title(f"Person {person_id}")
-    plt.legend()
-    plt.axis("equal")
-    plt.grid(True)
-    # plt.show()
-    os.makedirs(f"traj_pred/{version}", exist_ok=True)
-    plt.savefig(f"traj_pred/{version}/person_{person_id}_seed_{random_seed}.png")
+    all_pts = np.concatenate([observed_real[:, :2], future_real[:, :2]]
+                             + [Yk_pred_real[k][:, :2] for k in range(K)], axis=0)
+    pad = 5  # meters of padding around trajectories
+    # ax.set_xlim(all_pts[:, 0].min() - pad, all_pts[:, 0].max() + pad)
+    # ax.set_ylim(all_pts[:, 1].min() - pad, all_pts[:, 1].max() + pad)
+    
+    # # for pred 40
+    # ax.set_xlim(-5, 50)
+    # ax.set_ylim(-27, 10)
+    
+    # for pred 20
+    ax.set_xlim(-33, 7)
+    ax.set_ylim(-2.5, 17.5)
+
+    # ax.set_title(f"Person {person_id}")
+    ax.legend()
+    ax.set_aspect("equal")
+    ax.grid(True)
+    os.makedirs(f"traj_pred_quacompare/{version}", exist_ok=True)
+    # fig.savefig(f"traj_pred_quacompare/{version}/person_{person_id}_seed_{random_seed}.png", bbox_inches='tight')
+    fig.savefig(f"traj_pred_quacompare/{version}/person_{person_id}_seed_{random_seed}.pdf", bbox_inches='tight')
+    plt.close(fig)
+
+    # plt.title(f"Person {person_id}")
+    # plt.legend()
+    # plt.axis("equal")
+    # plt.grid(True)
+    # # plt.show()
+    # os.makedirs(f"traj_pred_final/{version}", exist_ok=True)
+    # plt.savefig(f"traj_pred_final/{version}/person_{person_id}_seed_{random_seed}.png")
     
     
     
